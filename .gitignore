@@ -7,3 +7,5 @@ build/
 .DS_Store
 *.iml
 .idea/
+claude_analysis*/
+*.png

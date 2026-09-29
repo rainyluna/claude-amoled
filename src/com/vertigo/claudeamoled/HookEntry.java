@@ -6,9 +6,11 @@ import android.os.Bundle;
 import android.view.View;
 import android.view.Window;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -27,8 +29,6 @@ public class HookEntry implements IXposedHookLoadPackage {
     // Compose Color(val value: ULong) where sRGB is (argb << 32)
     private static final long COLOR_AMOLED_BLACK = 0xFF00000000000000L;
 
-    private static final AtomicBoolean initialized = new AtomicBoolean(false);
-
     @Override
     public void handleLoadPackage(final XC_LoadPackage.LoadPackageParam lpparam) throws Throwable {
         if (!TARGET_PKG.equals(lpparam.packageName)) {
@@ -42,7 +42,7 @@ public class HookEntry implements IXposedHookLoadPackage {
         // 1. Hook MainActivity to guarantee AMOLED window backgrounds & status bar
         hookWindow(cl);
 
-        // 2. Hook direct known palette and theme classes for current build
+        // 2. Hook direct known palette and theme classes (both legacy and current build)
         hookKnownClasses(cl);
 
         // 3. Hook dynamic theme and ColorScheme construction for update resilience
@@ -60,8 +60,8 @@ public class HookEntry implements IXposedHookLoadPackage {
         long g = (argb >>> 8) & 0xFF;
         long b = argb & 0xFF;
 
-        // Matches dark greys (RGB <= 45, similar channels, opaque)
-        return a >= 200 && r <= 45 && g <= 45 && b <= 45 && Math.abs(r - g) <= 8 && Math.abs(g - b) <= 8;
+        // Matches dark greys (RGB <= 56, similar channels, opaque)
+        return a >= 200 && r <= 56 && g <= 56 && b <= 56 && Math.abs(r - g) <= 8 && Math.abs(g - b) <= 8;
     }
 
     private void hookWindow(final ClassLoader cl) {
@@ -100,98 +100,157 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     private void hookKnownClasses(final ClassLoader cl) {
-        // --- 1. fq5 (Palette Color Constants) ---
-        try {
-            Class<?> fq5 = XposedHelpers.findClassIfExists("fq5", cl);
-            if (fq5 != null) {
-                XposedBridge.hookMethod(fq5.getDeclaredConstructor(), new XC_MethodHook() {}); // triggers clinit if needed
-                patchFq5Fields(fq5);
+        // --- 1. Palette Color Constants: fq5 (v1.0), t58 (v1.260923.20) ---
+        hookPaletteClass(cl, "fq5", new String[]{"v", "w", "x", "y", "z", "s", "u", "t", "r"});
+        hookPaletteClass(cl, "t58", new String[]{"s", "t", "u", "v", "w", "x", "y", "z", "A", "B", "r"});
 
-                XposedHelpers.findAndHookMethod(fq5, "<clinit>", new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        patchFq5Fields((Class<?>) param.thisObject);
-                    }
-                });
-                XposedBridge.log(TAG + "Hooked fq5 palette");
+        // --- 2. Dark Theme Color Tokens: qul (v1.0), g4t (v1.260923.20) ---
+        hookPaletteClass(cl, "qul", new String[]{"n", "o", "p", "q", "r", "s", "E", "I", "H", "Q"});
+        hookPaletteClass(cl, "g4t", new String[]{"n", "o", "p", "q", "r", "s", "E", "F", "G", "H", "I", "Q"});
+
+        // --- 3. Dark Theme Palette: lz2 (v1.0), c24 (v1.260923.20) ---
+        hookPaletteClass(cl, "lz2", new String[]{"N", "O", "P", "Q", "R", "S", "T", "U"});
+        hookPaletteClass(cl, "c24", new String[]{"b0", "c0", "d0", "e0", "f0", "g0", "h0", "i0"});
+
+        // --- 4. Dark Theme Provider: tz2 (v1.0), i24 (v1.260923.20) ---
+        hookPaletteClass(cl, "tz2", new String[]{"O", "P", "Q", "R", "S", "T", "U"});
+        hookPaletteClass(cl, "i24", new String[]{"c0", "d0", "e0", "f0", "g0", "h0", "i0", "j0"});
+
+        // --- 5. Theme Holder: rp5.d (v1.0), f58.d (v1.260923.20) ---
+        hookThemeHolder(cl, "rp5");
+        hookThemeHolder(cl, "f58");
+
+        // --- 6. Design Tokens Theme Instance Constructor: hj4 (v1.0), zc6 (v1.260923.20) ---
+        hookThemeInstanceConstructor(cl, "hj4");
+        hookThemeInstanceConstructor(cl, "zc6");
+
+        // --- 7. Scheme Converter: jnb.i(hj4) (v1.0), w48.n(zc6) (v1.260923.20) ---
+        hookConverter(cl, "jnb", "i", "hj4");
+        hookConverter(cl, "w48", "n", "zc6");
+
+        // --- 8. Webview / Artifact CSS variables: mad (v1.0), imh (v1.260923.20) ---
+        hookCssClass(cl, "mad");
+        hookCssClass(cl, "imh");
+    }
+
+    private void hookPaletteClass(final ClassLoader cl, final String className, final String[] fieldNames) {
+        try {
+            Class<?> clazz = XposedHelpers.findClassIfExists(className, cl);
+            if (clazz != null) {
+                final Class<?> targetClass = clazz;
+                patchStaticPalette(targetClass, fieldNames);
+                try {
+                    XposedHelpers.findAndHookMethod(clazz, "<clinit>", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            patchStaticPalette(targetClass, fieldNames);
+                        }
+                    });
+                } catch (Throwable ignored) {}
+                XposedBridge.log(TAG + "Hooked palette class: " + className);
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "Note on fq5: " + t.getMessage());
+            XposedBridge.log(TAG + "Note on " + className + ": " + t.getMessage());
         }
+    }
 
-        // --- 2. qul (Dark Theme Color Tokens) ---
-        try {
-            Class<?> qul = XposedHelpers.findClassIfExists("qul", cl);
-            if (qul != null) {
-                patchQulFields(qul);
-                XposedHelpers.findAndHookMethod(qul, "<clinit>", new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        patchQulFields((Class<?>) param.thisObject);
+    private static void patchStaticPalette(Class<?> clazz, String[] fieldNames) {
+        if (clazz == null) return;
+        if (fieldNames != null) {
+            for (String fName : fieldNames) {
+                try {
+                    Field f = clazz.getDeclaredField(fName);
+                    f.setAccessible(true);
+                    f.setLong(null, COLOR_AMOLED_BLACK);
+                } catch (Throwable ignored) {}
+            }
+        }
+        // Also scan static long fields for any additional dark greys
+        for (Field f : clazz.getDeclaredFields()) {
+            if (Modifier.isStatic(f.getModifiers()) && f.getType() == long.class) {
+                try {
+                    f.setAccessible(true);
+                    long val = f.getLong(null);
+                    if (isDarkGreyColor(val)) {
+                        f.setLong(null, COLOR_AMOLED_BLACK);
                     }
-                });
-                XposedBridge.log(TAG + "Hooked qul dark tokens");
+                } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    private void hookThemeHolder(final ClassLoader cl, final String className) {
+        try {
+            Class<?> clazz = XposedHelpers.findClassIfExists(className, cl);
+            if (clazz != null) {
+                final Class<?> targetClass = clazz;
+                patchThemeHolder(targetClass);
+                try {
+                    XposedHelpers.findAndHookMethod(clazz, "<clinit>", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            patchThemeHolder(targetClass);
+                        }
+                    });
+                } catch (Throwable ignored) {}
+                XposedBridge.log(TAG + "Hooked theme holder: " + className);
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "Note on qul: " + t.getMessage());
+            XposedBridge.log(TAG + "Note on " + className + ": " + t.getMessage());
         }
+    }
 
-        // --- 3. lz2 & tz2 (Dark Theme Palette & Provider) ---
+    private static void patchThemeHolder(Class<?> holderClass) {
+        if (holderClass == null) return;
         try {
-            Class<?> lz2 = XposedHelpers.findClassIfExists("lz2", cl);
-            if (lz2 != null) {
-                patchLz2Fields(lz2);
-                XposedHelpers.findAndHookMethod(lz2, "<clinit>", new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        patchLz2Fields((Class<?>) param.thisObject);
-                    }
-                });
-                XposedBridge.log(TAG + "Hooked lz2");
+            Field dField = holderClass.getDeclaredField("d");
+            dField.setAccessible(true);
+            Object darkTheme = dField.get(null);
+            if (darkTheme != null) {
+                patchObjectColors(darkTheme);
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "Note on lz2: " + t.getMessage());
+            XposedBridge.log(TAG + "Error patching " + holderClass.getName() + ".d: " + t.getMessage());
         }
+    }
 
+    private void hookThemeInstanceConstructor(final ClassLoader cl, final String className) {
         try {
-            Class<?> tz2 = XposedHelpers.findClassIfExists("tz2", cl);
-            if (tz2 != null) {
-                patchTz2Fields(tz2);
-                XposedHelpers.findAndHookMethod(tz2, "<clinit>", new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        patchTz2Fields((Class<?>) param.thisObject);
-                    }
-                });
-                XposedBridge.log(TAG + "Hooked tz2");
+            Class<?> clazz = XposedHelpers.findClassIfExists(className, cl);
+            if (clazz != null) {
+                for (Constructor<?> ctor : clazz.getDeclaredConstructors()) {
+                    XposedBridge.hookMethod(ctor, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            Object instance = param.thisObject;
+                            if (instance != null) {
+                                try {
+                                    // Field 'b' is boolean isDarkTheme in both hj4 and zc6
+                                    Field bField = instance.getClass().getDeclaredField("b");
+                                    bField.setAccessible(true);
+                                    if (bField.getBoolean(instance)) {
+                                        patchObjectColors(instance);
+                                    }
+                                } catch (NoSuchFieldException e) {
+                                    patchObjectColors(instance);
+                                }
+                            }
+                        }
+                    });
+                }
+                XposedBridge.log(TAG + "Hooked constructor of: " + className);
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "Note on tz2: " + t.getMessage());
+            XposedBridge.log(TAG + "Note on " + className + " constructor: " + t.getMessage());
         }
+    }
 
-        // --- 4. rp5 (Theme Holder containing dark hj4 instance) ---
+    private void hookConverter(final ClassLoader cl, final String converterClass, final String methodName, final String paramClass) {
         try {
-            Class<?> rp5 = XposedHelpers.findClassIfExists("rp5", cl);
-            if (rp5 != null) {
-                patchRp5(rp5);
-                XposedHelpers.findAndHookMethod(rp5, "<clinit>", new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        patchRp5((Class<?>) param.thisObject);
-                    }
-                });
-                XposedBridge.log(TAG + "Hooked rp5");
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "Note on rp5: " + t.getMessage());
-        }
-
-        // --- 5. jnb.i (converts hj4 to Material 3 ColorScheme wp5) ---
-        try {
-            Class<?> jnb = XposedHelpers.findClassIfExists("jnb", cl);
-            Class<?> hj4 = XposedHelpers.findClassIfExists("hj4", cl);
-            if (jnb != null && hj4 != null) {
-                XposedHelpers.findAndHookMethod(jnb, "i", hj4, new XC_MethodHook() {
+            Class<?> convClazz = XposedHelpers.findClassIfExists(converterClass, cl);
+            Class<?> pClazz = XposedHelpers.findClassIfExists(paramClass, cl);
+            if (convClazz != null && pClazz != null) {
+                XposedHelpers.findAndHookMethod(convClazz, methodName, pClazz, new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) throws Throwable {
                         Object colorScheme = param.getResult();
@@ -200,108 +259,62 @@ public class HookEntry implements IXposedHookLoadPackage {
                         }
                     }
                 });
-                XposedBridge.log(TAG + "Hooked jnb.i");
+                XposedBridge.log(TAG + "Hooked " + converterClass + "." + methodName + "(" + paramClass + ")");
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "Note on jnb: " + t.getMessage());
+            XposedBridge.log(TAG + "Note on " + converterClass + "." + methodName + ": " + t.getMessage());
         }
+    }
 
-        // --- 6. mad (Webview / Artifact CSS variables) ---
+    private void hookCssClass(final ClassLoader cl, final String className) {
         try {
-            Class<?> mad = XposedHelpers.findClassIfExists("mad", cl);
-            if (mad != null) {
-                patchMadCss(mad);
-                XposedHelpers.findAndHookMethod(mad, "<clinit>", new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) throws Throwable {
-                        patchMadCss((Class<?>) param.thisObject);
-                    }
-                });
-                XposedBridge.log(TAG + "Hooked mad CSS variables");
+            Class<?> clazz = XposedHelpers.findClassIfExists(className, cl);
+            if (clazz != null) {
+                final Class<?> targetClass = clazz;
+                patchMadCss(targetClass);
+                try {
+                    XposedHelpers.findAndHookMethod(clazz, "<clinit>", new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            patchMadCss(targetClass);
+                        }
+                    });
+                } catch (Throwable ignored) {}
+                XposedBridge.log(TAG + "Hooked CSS class: " + className);
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "Note on mad: " + t.getMessage());
-        }
-    }
-
-    private static void patchFq5Fields(Class<?> clazz) {
-        if (clazz == null) return;
-        // Fields for dark grey tones: v, w, x, y, z, s, u, t, r
-        String[] fields = {"v", "w", "x", "y", "z", "s", "u", "t", "r"};
-        for (String fName : fields) {
-            try {
-                Field f = clazz.getDeclaredField(fName);
-                f.setAccessible(true);
-                f.setLong(null, COLOR_AMOLED_BLACK);
-            } catch (Throwable ignored) {}
-        }
-    }
-
-    private static void patchQulFields(Class<?> clazz) {
-        if (clazz == null) return;
-        String[] fields = {"n", "o", "p", "q", "r", "s", "E", "I", "H", "Q"};
-        for (String fName : fields) {
-            try {
-                Field f = clazz.getDeclaredField(fName);
-                f.setAccessible(true);
-                f.setLong(null, COLOR_AMOLED_BLACK);
-            } catch (Throwable ignored) {}
-        }
-    }
-
-    private static void patchLz2Fields(Class<?> clazz) {
-        if (clazz == null) return;
-        String[] fields = {"N", "O", "P", "Q", "R", "S", "T", "U"};
-        for (String fName : fields) {
-            try {
-                Field f = clazz.getDeclaredField(fName);
-                f.setAccessible(true);
-                f.setLong(null, COLOR_AMOLED_BLACK);
-            } catch (Throwable ignored) {}
-        }
-    }
-
-    private static void patchTz2Fields(Class<?> clazz) {
-        if (clazz == null) return;
-        String[] fields = {"O", "P", "Q", "R", "S", "T", "U"};
-        for (String fName : fields) {
-            try {
-                Field f = clazz.getDeclaredField(fName);
-                f.setAccessible(true);
-                f.setLong(null, COLOR_AMOLED_BLACK);
-            } catch (Throwable ignored) {}
-        }
-    }
-
-    private static void patchRp5(Class<?> rp5Class) {
-        if (rp5Class == null) return;
-        try {
-            // d is the dark theme hj4 instance
-            Field dField = rp5Class.getDeclaredField("d");
-            dField.setAccessible(true);
-            Object darkTheme = dField.get(null);
-            if (darkTheme != null) {
-                patchObjectColors(darkTheme);
-            }
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + "Error patching rp5.d: " + t.getMessage());
+            XposedBridge.log(TAG + "Note on " + className + ": " + t.getMessage());
         }
     }
 
     private static void patchObjectColors(Object obj) {
-        if (obj == null) return;
+        patchObjectColors(obj, 0);
+    }
+
+    private static void patchObjectColors(Object obj, int depth) {
+        if (obj == null || depth > 2) return;
         Class<?> cl = obj.getClass();
+        String className = cl.getName();
+        if (className.startsWith("android.") || className.startsWith("java.") || className.startsWith("kotlin.")) {
+            return;
+        }
         while (cl != null && cl != Object.class) {
             for (Field f : cl.getDeclaredFields()) {
-                if (f.getType() == long.class && !Modifier.isStatic(f.getModifiers())) {
-                    try {
-                        f.setAccessible(true);
+                if (Modifier.isStatic(f.getModifiers())) continue;
+                try {
+                    f.setAccessible(true);
+                    if (f.getType() == long.class) {
                         long val = f.getLong(obj);
                         if (isDarkGreyColor(val)) {
                             f.setLong(obj, COLOR_AMOLED_BLACK);
                         }
-                    } catch (Throwable ignored) {}
-                }
+                    } else if (!f.getType().isPrimitive() && depth < 2) {
+                        Object nested = f.get(obj);
+                        if (nested != null) {
+                            patchObjectColors(nested, depth + 1);
+                        }
+                    }
+                } catch (Throwable ignored) {}
             }
             cl = cl.getSuperclass();
         }
@@ -309,7 +322,7 @@ public class HookEntry implements IXposedHookLoadPackage {
 
     private static void patchColorScheme(Object colorScheme) {
         if (colorScheme == null) return;
-        // In wp5 (Material3 ColorScheme):
+        // In wp5 / l58 (Material3 ColorScheme):
         // background = n, surface = p, surfaceVariant = r,
         // surfaceBright = D, surfaceDim = E, surfaceContainer = F,
         // surfaceContainerHigh = G, surfaceContainerHighest = H,
@@ -328,39 +341,47 @@ public class HookEntry implements IXposedHookLoadPackage {
     }
 
     @SuppressWarnings("unchecked")
-    private static void patchMadCss(Class<?> madClass) {
-        if (madClass == null) return;
+    private static void patchMadCss(Class<?> cssClass) {
+        if (cssClass == null) return;
         try {
-            Field aField = madClass.getDeclaredField("a");
+            Field aField = cssClass.getDeclaredField("a");
             aField.setAccessible(true);
             Object mapObj = aField.get(null);
             if (mapObj instanceof Map) {
                 Map map = (Map) mapObj;
-                for (Object key : map.keySet()) {
-                    Object val = map.get(key);
+                Map newMap = new LinkedHashMap(map);
+                boolean modified = false;
+                for (Object key : newMap.keySet()) {
+                    Object val = newMap.get(key);
                     if (val instanceof String) {
                         String s = (String) val;
-                        // Replace dark background rgba values with pure black
                         if (s.contains("rgba(48, 48, 46, 1)") || s.contains("rgba(38, 38, 36, 1)") || s.contains("rgba(20, 20, 19, 1)")) {
                             s = s.replace("rgba(48, 48, 46, 1)", "rgba(0, 0, 0, 1)")
                                  .replace("rgba(38, 38, 36, 1)", "rgba(0, 0, 0, 1)")
                                  .replace("rgba(20, 20, 19, 1)", "rgba(0, 0, 0, 1)");
-                            map.put(key, s);
+                            newMap.put(key, s);
+                            modified = true;
                         }
+                    }
+                }
+                if (modified) {
+                    try {
+                        map.putAll(newMap);
+                    } catch (Throwable t) {
+                        aField.set(null, newMap);
                     }
                 }
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + "Error patching mad CSS: " + t.getMessage());
+            XposedBridge.log(TAG + "Error patching CSS on " + cssClass.getName() + ": " + t.getMessage());
         }
     }
 
     /**
-     * Dynamic scanner to identify and hook ColorScheme and theme methods even after app updates.
+     * Dynamic scanner to identify and hook ColorScheme and theme methods even after future app updates.
      */
     private void hookDynamicScheme(final ClassLoader cl) {
         try {
-            // Hook ClassLoader to catch classes as they are loaded
             XposedHelpers.findAndHookMethod(ClassLoader.class, "loadClass", String.class, boolean.class, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) throws Throwable {
@@ -372,12 +393,26 @@ public class HookEntry implements IXposedHookLoadPackage {
                         return;
                     }
 
+                    // Explicit late-loading check for target classes
+                    if ("t58".equals(name)) {
+                        patchStaticPalette(loadedClass, new String[]{"s", "t", "u", "v", "w", "x", "y", "z", "A", "B", "r"});
+                    } else if ("g4t".equals(name)) {
+                        patchStaticPalette(loadedClass, new String[]{"n", "o", "p", "q", "r", "s", "E", "F", "G", "H", "I", "Q"});
+                    } else if ("c24".equals(name)) {
+                        patchStaticPalette(loadedClass, new String[]{"b0", "c0", "d0", "e0", "f0", "g0", "h0", "i0"});
+                    } else if ("i24".equals(name)) {
+                        patchStaticPalette(loadedClass, new String[]{"c0", "d0", "e0", "f0", "g0", "h0", "i0", "j0"});
+                    } else if ("f58".equals(name)) {
+                        patchThemeHolder(loadedClass);
+                    } else if ("imh".equals(name)) {
+                        patchMadCss(loadedClass);
+                    }
+
                     // Check if class is ColorScheme (has toString with "ColorScheme(primary=")
                     try {
                         Method toStringMethod = loadedClass.getDeclaredMethod("toString");
                         if (toStringMethod != null && !Modifier.isAbstract(loadedClass.getModifiers())) {
-                            // Check if constructor has ~48 long arguments
-                            for (java.lang.reflect.Constructor<?> ctor : loadedClass.getDeclaredConstructors()) {
+                            for (Constructor<?> ctor : loadedClass.getDeclaredConstructors()) {
                                 Class<?>[] params = ctor.getParameterTypes();
                                 if (params.length >= 25 && params[0] == long.class) {
                                     XposedBridge.hookMethod(ctor, new XC_MethodHook() {
