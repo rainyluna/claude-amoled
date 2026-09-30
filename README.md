@@ -1,58 +1,48 @@
-# Claude AMOLED (LSPosed Module)
+# Claude AMOLED
 
-An LSPosed / Xposed module that transforms the official **Claude for Android** (`com.anthropic.claude`) dark theme into a true **Pitch Black AMOLED (#000000)** experience.
+LSPosed module targeting the official Claude for Android client (`com.anthropic.claude`). Converts the dark theme into an opaque `#000000` AMOLED black palette across Jetpack Compose surfaces, system bars, and WebView artifact sandboxes.
 
-Designed specifically for OLED / AMOLED displays to maximize battery life, reduce eye strain in low-light environments, and provide high contrast without breaking Jetpack Compose layouts.
+## Technical Architecture
 
----
+- **Jetpack Compose ColorScheme**: Intercepts Compose theme initialization and patches 64-bit color values (`ULong`) for background, surface, and surface container tiers to pure black (`0xFF00000000000000L`).
+- **Surface Elevation & Borders**: Retains surface borders and container elevation distinctions so input pills (model selector, upgrades, speech-to-text) remain visually defined over black backdrops.
+- **WebView / Artifact Tokens**: Patches internal CSS tokens (`mad.a`) responsible for rendering Claude artifact previews, enforcing `#000000` background styling inside the embedded web runtime.
+- **System Bars**: Automatically forces status bar and navigation bar decor views to pure black on activity creation.
+- **Dynamic Hooking**: Scans loaded classes via `ClassLoader.loadClass` to identify `ColorScheme` constructors by signature, maintaining compatibility across minor Anthropic client updates.
 
-## 🌟 Features
+## Prerequisites
 
-- **True Pitch Black AMOLED (`#000000`)**: Replaces dark grey backgrounds with pure black, turning off pixels on OLED displays.
-- **Floating Surfaces & Clean Contrast**: Bottom input container, cards, and modal dialogs are styled with pure black backgrounds and subtle borders, keeping button pills (like model selector, upgrades, dictation) crisp and interactive.
-- **Edge-to-Edge System Bar Integration**: Automatically applies pure black to the status bar and navigation bar decor views.
-- **WebView & Artifact Blackout**: Patches internal CSS tokens (`mad.a`) for artifact previews and sandboxes to pure black.
-- **Dynamic & Update Resilient**: Uses a combination of direct hooks and dynamic runtime detection to remain compatible across future Claude updates.
-- **Zero Configuration**: Uses Android LSPosed modern metadata scope (`xposedscope`) to pre-select Claude automatically in LSPosed Manager.
+- Android 8.0+ (API 26-36).
+- Working LSPosed / Xposed framework.
+- Java JDK 17.
+- Android SDK Build-Tools (34.0.0+) and Android API 34 platform jar (`android.jar`).
 
----
-
-## 📱 Requirements
-
-- Android 8.0+ (API 26+) up to Android 16+
-- Root access (KernelSU, APatch, or Magisk)
-- Zygisk-LSPosed or compatible modern Xposed framework
-- Official **Claude** app installed (`com.anthropic.claude`)
-
----
-
-## 🚀 Installation
-
-1. Download the latest `claude-amoled.apk` from the [Releases](https://github.com/rainyluna/claude-amoled/releases) page.
-2. Install the APK on your rooted device.
-3. Open **LSPosed Manager**:
-   - Tap the module notification or navigate to Modules.
-   - Enable **Claude AMOLED**.
-   - Verify that **Claude** (`com.anthropic.claude`) is checked in the module's scope (pre-selected by default).
-4. Force close and relaunch the Claude app.
-5. Make sure Dark Mode is active in the Claude app settings or system-wide. Enjoy pure black AMOLED!
-
----
-
-## 🛠️ Building from Source
-
-The repository includes standalone Xposed stubs and an automated build script:
+## Building from Source
 
 ```bash
 git clone https://github.com/rainyluna/claude-amoled.git
 cd claude-amoled
+chmod +x build.sh
 ./build.sh
 ```
 
-The script compiles the stubs, converts sources to DEX via `d8`, compiles resources via `aapt2`, aligns with `zipalign`, and signs the output as `claude-amoled.apk`.
+### Build Pipeline
+1. `javac` compiles standalone Xposed stubs in `stubs/`.
+2. `javac` compiles `src/com/vertigo/claudeamoled/HookEntry.java` against `android.jar` and compiled stubs.
+3. `d8` converts classes into `classes.dex` targeting API 34.
+4. `aapt2` compiles and links package resources and manifest.
+5. `zip` packages DEX and assets into unaligned APK.
+6. `zipalign` 4-byte aligns the package.
+7. `apksigner` signs using debug RSA-2048 keys.
+8. Output artifact: `claude-amoled.apk`.
 
----
+## Installation
 
-## 📄 License
-
-This project is licensed under the [MIT License](LICENSE).
+```bash
+adb install -r claude-amoled.apk
+```
+Enable the module in LSPosed Manager, confirm `com.anthropic.claude` is checked in scope, then force-stop and launch Claude:
+```bash
+adb shell am force-stop com.anthropic.claude
+adb shell am start -n com.anthropic.claude/.MainActivity
+```
